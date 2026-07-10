@@ -4,11 +4,15 @@ Single-run signal check for GitHub Actions (or any cron).
 
 Fetches recent candles, checks the last CLOSED candle for an EMA-crossover
 signal, and if that candle JUST closed (within CRON_INTERVAL_MIN), sends a
-Telegram alert. Then exits. Designed to be triggered on a schedule, so it does
-NOT loop -- the scheduler runs it repeatedly.
+Telegram alert. Then exits.
 
-Secrets/config come from environment variables (set TELEGRAM_* as GitHub Actions
-Secrets; the rest are set in the workflow file):
+Data source resilience:
+Many exchanges (Bybit, Binance, ...) block requests from cloud/datacenter IPs
+like GitHub's runners (HTTP 403). So this tries several exchanges in order and
+uses the first that responds. BTC's price is ~identical across them, so signals
+are unaffected. Kraken/Coinbase are datacenter-friendly and go first.
+
+Secrets/config via environment variables (TELEGRAM_* as GitHub Actions Secrets):
     TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, SYMBOL, TIMEFRAME, CRON_INTERVAL_MIN
 
 Requirements: pip install ccxt pandas requests
@@ -22,18 +26,13 @@ import ccxt
 import pandas as pd
 import requests
 
-DATA_EXCHANGE = os.getenv("DATA_EXCHANGE", "bybit")
-SYMBOL = os.getenv("SYMBOL", "BTC/USDC")
+SYMBOL = os.getenv("SYMBOL", "BTC/USDC")        # base coin is parsed from this
 TIMEFRAME = os.getenv("TIMEFRAME", "1h")
 EMA_FAST = int(os.getenv("EMA_FAST", "9"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "21"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
-
-# Must match your workflow's cron spacing. Only alert if the last closed candle
-# closed within this many minutes -- prevents duplicate alerts when several
-# scheduled runs happen during the same candle.
 CRON_INTERVAL_MIN = int(os.getenv("CRON_INTERVAL_MIN", "15"))
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -41,6 +40,23 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 TF_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30,
               "1h": 60, "2h": 120, "4h": 240, "1d": 1440}
+
+
+def base_of(symbol):
+    return symbol.split("/")[0].upper()
+
+
+def candidate_sources(symbol):
+    """(exchange_id, symbol) pairs to try in order. Datacenter-friendly first."""
+    b = base_of(symbol)
+    return [
+        ("kraken", f"{b}/USD"),
+        ("coinbase", f"{b}/USDC"),
+        ("coinbase", f"{b}/USD"),
+        ("kraken", f"{b}/USDT"),
+        ("bybit", f"{b}/USDT"),
+        ("binance", f"{b}/USDT"),
+    ]
 
 
 def ema(s, span):
@@ -51,9 +67,9 @@ def rsi(s, period):
     d = s.diff()
     gain = d.clip(lower=0)
     loss = -d.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    return 100 - (100 / (1 + avg_gain / avg_loss))
+    ag = gain.ewm(alpha=1 / period, adjust=False).mean()
+    al = loss.ewm(alpha=1 / period, adjust=False).mean()
+    return 100 - (100 / (1 + ag / al))
 
 
 def crossover(d_prev, d_last):
@@ -62,6 +78,24 @@ def crossover(d_prev, d_last):
     if d_prev >= 0 > d_last:
         return "SELL"
     return None
+
+
+def fetch_from_any():
+    """Try each source until one returns candles. Returns (df, label) or (None, None)."""
+    for ex_id, sym in candidate_sources(SYMBOL):
+        try:
+            ex = getattr(ccxt, ex_id)({"enableRateLimit": True})
+            ohlcv = ex.fetch_ohlcv(sym, timeframe=TIMEFRAME, limit=200)
+            if ohlcv and len(ohlcv) >= 30:
+                df = pd.DataFrame(
+                    ohlcv,
+                    columns=["timestamp", "open", "high", "low", "close", "volume"],
+                )
+                print(f"Data source: {ex_id} {sym}", flush=True)
+                return df, f"{ex_id}:{sym}"
+        except Exception as e:
+            print(f"  {ex_id} {sym} unavailable: {str(e)[:120]}", flush=True)
+    return None, None
 
 
 def send_telegram(text):
@@ -81,24 +115,23 @@ def send_telegram(text):
 
 
 def main():
-    ex = getattr(ccxt, DATA_EXCHANGE)({"enableRateLimit": True})
-    ohlcv = ex.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=200)
-    df = pd.DataFrame(
-        ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]
-    )
+    df, label = fetch_from_any()
+    if df is None:
+        print("Could not reach any data source this run (all blocked/errored). "
+              "Will try again next run.", flush=True)
+        return
+
     df["ef"] = ema(df["close"], EMA_FAST)
     df["es"] = ema(df["close"], EMA_SLOW)
     df["rsi"] = rsi(df["close"], RSI_PERIOD)
     df["diff"] = df["ef"] - df["es"]
 
-    # -1 is the still-forming candle; -2 is the last CLOSED candle.
-    prev, last = df.iloc[-3], df.iloc[-2]
+    prev, last = df.iloc[-3], df.iloc[-2]      # last CLOSED candle = -2
     signal = crossover(prev["diff"], last["diff"])
     if not signal:
         print("No new crossover on last closed candle.", flush=True)
         return
 
-    # Only alert if that candle closed recently (freshness-based dedupe).
     tf_ms = TF_MINUTES.get(TIMEFRAME, 60) * 60_000
     close_time_ms = int(last["timestamp"]) + tf_ms
     age_min = (time.time() * 1000 - close_time_ms) / 60_000
@@ -117,8 +150,8 @@ def main():
         note = "  (RSI oversold -- weaker sell)"
 
     send_telegram(
-        f"[{signal}] {SYMBOL} @ {price:.2f} | RSI {r:.0f} | "
-        f"EMA{EMA_FAST}/{EMA_SLOW} crossover{note}"
+        f"[{signal}] {base_of(SYMBOL)} @ {price:.2f} | RSI {r:.0f} | "
+        f"EMA{EMA_FAST}/{EMA_SLOW} crossover{note}  (src {label})"
     )
 
 
