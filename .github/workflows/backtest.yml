@@ -1,0 +1,37 @@
+name: backtest
+
+# Manual only -- click "Run workflow" in the Actions tab. You can tweak the
+# inputs each run to experiment. Results print in the run's log (no Telegram).
+on:
+  workflow_dispatch:
+    inputs:
+      timeframe:
+        description: "Candle timeframe (1h, 4h, 1d, ...)"
+        default: "1h"
+      candles:
+        description: "How many candles to test (max 1000)"
+        default: "1000"
+      adx_min:
+        description: "ADX threshold for the choppiness filter"
+        default: "20"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install ccxt pandas
+      - name: Run backtest comparison
+        run: python backtest.py
+        env:
+          SYMBOL: "BTC/USDC"
+          TIMEFRAME: ${{ inputs.timeframe }}
+          BACKTEST_CANDLES: ${{ inputs.candles }}
+          ADX_MIN: ${{ inputs.adx_min }}
+          EMA_FAST: "9"
+          EMA_SLOW: "21"
+          TREND_EMA: "200"
