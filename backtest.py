@@ -56,17 +56,25 @@ def ema(s, span):
 
 
 def adx(high, low, close, period):
+    """Wilder-style ADX. Uses float NaN (not pd.NA) for zero-denominator
+    guards -- pd.NA forces dtype 'object', which ewm() cannot aggregate."""
+    nan = float("nan")
+    high = high.astype("float64")
+    low = low.astype("float64")
+    close = close.astype("float64")
+
     up = high.diff()
     down = -low.diff()
-    plus_dm = ((up > down) & (up > 0)) * up
-    minus_dm = ((down > up) & (down > 0)) * down
+    plus_dm = (((up > down) & (up > 0)) * up).astype("float64")
+    minus_dm = (((down > up) & (down > 0)) * down).astype("float64")
     tr = pd.concat([(high - low), (high - close.shift()).abs(),
                     (low - close.shift()).abs()], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
+    atr = tr.ewm(alpha=1 / period, adjust=False).mean().replace(0, nan)
     plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
     minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)
-    return dx.ewm(alpha=1 / period, adjust=False).mean()
+    denom = (plus_di + minus_di).replace(0, nan)
+    dx = (100 * (plus_di - minus_di).abs() / denom).astype("float64")
+    return dx.ewm(alpha=1 / period, adjust=False).mean().astype("float64")
 
 
 def crossover(d_prev, d_last):
